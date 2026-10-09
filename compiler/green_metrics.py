@@ -15,6 +15,12 @@ class GreenMetrics:
     def start(self, phase: str) -> None:
         self.phase_starts[phase] = time.perf_counter()
 
+    def start_total(self) -> None:
+        self.start("total")
+
+    def end_total(self) -> None:
+        self.end("total")
+
     def end(self, phase: str) -> None:
         started = self.phase_starts.get(phase)
         if started is None:
