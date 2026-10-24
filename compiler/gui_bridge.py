@@ -14,6 +14,7 @@ from compiler.unused_var_fixer import remove_unused_decl_at
 from compiler.security_auto_fixer import SecurityAutoFixer
 from compiler.green_energy import GreenEnergyTracker
 from compiler.green_system import GreenSystemTracker
+from compiler.aai_guardrail import default_guardrail, GuardrailResult
 
 from test_parser import (
     parse_source,
@@ -141,6 +142,57 @@ def _compute_changed_lines(old_text: str, new_text: str) -> List[int]:
             changed.append(i + 1)
 
     return changed
+
+
+def _build_suggestions(
+    original_source: str,
+    repaired_source: str,
+    steps: List[str],
+) -> List[Dict[str, Any]]:
+    orig_lines = original_source.splitlines()
+    rep_lines = repaired_source.splitlines()
+    max_len = max(len(orig_lines), len(rep_lines))
+    suggestions = []
+
+    for i in range(max_len):
+        old_l = orig_lines[i] if i < len(orig_lines) else ""
+        new_l = rep_lines[i] if i < len(rep_lines) else ""
+        if old_l != new_l:
+            line_num = i + 1
+            explanation = "Syntax or code structure repair required."
+            for st in steps:
+                if f"L{line_num}" in st or f"line {line_num}" in st.lower():
+                    explanation = st
+                    break
+            if explanation == "Syntax or code structure repair required." and steps:
+                step_idx = min(len(suggestions), len(steps) - 1)
+                explanation = steps[step_idx]
+
+            sug_id = f"sug_L{line_num}_{abs(hash(old_l)) % 1000000:06d}"
+            category = "SYNTAX"
+            if any(k in explanation for k in ["SYM:", "SEM:", "undeclared"]):
+                category = "SEMANTIC"
+            elif any(k in explanation for k in ["SEC:", "Security", "unsafe"]):
+                category = "SECURITY"
+            elif "LEX:" in explanation:
+                category = "LEXICAL"
+
+            suggestions.append({
+                "id": sug_id,
+                "category": category,
+                "title": f"Fix at line {line_num}",
+                "line": line_num,
+                "column": 1,
+                "original_snippet": old_l,
+                "suggested_snippet": new_l,
+                "explanation": explanation,
+                "diff": {
+                    "delete": old_l,
+                    "insert": new_l,
+                },
+            })
+
+    return suggestions
 
 
 def _collect_security_issues(source_text: str) -> List[str]:
@@ -395,7 +447,11 @@ def _finalize_green_report(
         pass
 
 
-def repair_source_for_gui_stream(source_text: str, filename: str = "main.c"):
+def repair_source_for_gui_stream(
+    source_text: str,
+    filename: str = "main.c",
+    autocorrect: bool = True,
+):
     original_source = source_text
     working = source_text
 
@@ -420,7 +476,44 @@ def repair_source_for_gui_stream(source_text: str, filename: str = "main.c"):
         "iterations": 0,
     }
 
-    yield _emit_progress("start", f"Started repairing {filename}", working, steps, stats)
+    # Step 1: Input Guardrail Check
+    yield _emit_progress("guardrail", "Scanning input with AAI Guardrail...", working if autocorrect else original_source, steps, stats)
+    guard_res = default_guardrail.scan_input(source_text, context={"filename": filename})
+    if not guard_res.passed:
+        yield _emit_progress(
+            "guardrail_blocked",
+            f"AAI Guardrail Alert: {guard_res.reason}",
+            working if autocorrect else original_source,
+            steps,
+            stats,
+            status="BLOCKED_AAI_ATTACK",
+        )
+        blocked_result = {
+            "type": "done",
+            "success": False,
+            "status": "BLOCKED_AAI_ATTACK",
+            "filename": filename,
+            "original_code": original_source,
+            "corrected_code": original_source if autocorrect else None,
+            "autocorrect": autocorrect,
+            "applied_steps": [],
+            "logs": [f"AAI Guardrail Alert: {guard_res.reason}"],
+            "errors": [f"Blocked malicious attack payload: {guard_res.quarantined_snippet}"],
+            "semantic_issues": [],
+            "security_warnings": [],
+            "changed_lines": [],
+            "security_changed_lines": [],
+            "stats": stats,
+            "green_report": {},
+            "guardrail_report": guard_res.to_dict(),
+            "suggestions": [],
+            "total_applied_steps": 0,
+            "total_repairs": 0,
+        }
+        yield blocked_result
+        return
+
+    yield _emit_progress("start", f"Started repairing {filename}", working if autocorrect else original_source, steps, stats)
 
     green = GreenMetrics()
 
@@ -564,6 +657,11 @@ def repair_source_for_gui_stream(source_text: str, filename: str = "main.c"):
             if cmd is None or ai_src == working or tree2 is None:
                 break
 
+            patch_check = default_guardrail.scan_candidate_patch(working, ai_src, context={"filename": filename, "source": "ai_stream"})
+            if not patch_check.passed:
+                yield _emit_progress("detect", f"Quarantined patch: {patch_check.reason}", working if autocorrect else original_source, steps, stats, status="UNFIXABLE")
+                break
+
             working = ai_src
             steps.append(f"AI: {cmd}")
             stats["ai_fixes"] += 1
@@ -571,7 +669,7 @@ def repair_source_for_gui_stream(source_text: str, filename: str = "main.c"):
             edits += 1
             tree, listeners, parser = tree2, listeners2, parser2
 
-            yield _emit_progress("fix", f"AI: {cmd}", working, steps, stats)
+            yield _emit_progress("fix", f"AI: {cmd}", working if autocorrect else original_source, steps, stats)
 
         else:
             deterministic_attempted = False
@@ -593,7 +691,7 @@ def repair_source_for_gui_stream(source_text: str, filename: str = "main.c"):
                     if tree is None:
                         break
 
-                    yield _emit_progress("fix", f"RULE: {applied}", working, steps, stats)
+                    yield _emit_progress("fix", f"RULE: {applied}", working if autocorrect else original_source, steps, stats)
 
             if has_any_errors(listeners):
                 if classification.reason not in DETERMINISTIC_REASONS or (
@@ -610,6 +708,11 @@ def repair_source_for_gui_stream(source_text: str, filename: str = "main.c"):
                     if cmd is None or ai_src == working or tree2 is None:
                         break
 
+                    patch_check = default_guardrail.scan_candidate_patch(working, ai_src, context={"filename": filename, "source": "ai_stream_fallback"})
+                    if not patch_check.passed:
+                        yield _emit_progress("detect", f"Quarantined patch: {patch_check.reason}", working if autocorrect else original_source, steps, stats, status="UNFIXABLE")
+                        break
+
                     working = ai_src
                     steps.append(f"AI: {cmd}")
                     stats["ai_fixes"] += 1
@@ -617,7 +720,7 @@ def repair_source_for_gui_stream(source_text: str, filename: str = "main.c"):
                     edits += 1
                     tree, listeners, parser = tree2, listeners2, parser2
 
-                    yield _emit_progress("fix", f"AI: {cmd}", working, steps, stats)
+                    yield _emit_progress("fix", f"AI: {cmd}", working if autocorrect else original_source, steps, stats)
 
         cur_error_count = len(get_all_error_strings(listeners))
         if cur_error_count < best_error_count:
@@ -634,7 +737,7 @@ def repair_source_for_gui_stream(source_text: str, filename: str = "main.c"):
 
     green.end("syntax_repair")
 
-    final_result = repair_source_for_gui(working, filename)
+    final_result = repair_source_for_gui(original_source, filename, autocorrect=autocorrect)
     final_result["type"] = "done"
     final_result["total_repairs"] = (
         final_result["stats"].get("lex_fixes", 0)
@@ -646,7 +749,11 @@ def repair_source_for_gui_stream(source_text: str, filename: str = "main.c"):
     yield final_result
 
 
-def repair_source_for_gui(source_text: str, filename: str = "main.c") -> Dict[str, Any]:
+def repair_source_for_gui(
+    source_text: str,
+    filename: str = "main.c",
+    autocorrect: bool = True,
+) -> Dict[str, Any]:
     original_source = source_text
     working = source_text
 
@@ -672,6 +779,31 @@ def repair_source_for_gui(source_text: str, filename: str = "main.c") -> Dict[st
         "iterations": 0,
     }
 
+    # Step 1: Input Guardrail Check
+    guard_res = default_guardrail.scan_input(source_text, context={"filename": filename})
+    if not guard_res.passed:
+        logs.append(f"AAI Guardrail Alert: {guard_res.reason}")
+        return {
+            "success": False,
+            "status": "BLOCKED_AAI_ATTACK",
+            "filename": filename,
+            "original_code": original_source,
+            "corrected_code": original_source if autocorrect else None,
+            "autocorrect": autocorrect,
+            "applied_steps": [],
+            "logs": logs,
+            "errors": [f"Blocked malicious attack payload: {guard_res.quarantined_snippet}"],
+            "semantic_issues": [],
+            "security_warnings": [],
+            "changed_lines": [],
+            "security_changed_lines": [],
+            "stats": stats,
+            "green_report": {},
+            "guardrail_report": guard_res.to_dict(),
+            "suggestions": [],
+            "total_applied_steps": 0,
+        }
+
     green = GreenMetrics()
 
     energy = GreenEnergyTracker()
@@ -686,7 +818,9 @@ def repair_source_for_gui(source_text: str, filename: str = "main.c") -> Dict[st
         "success": False,
         "status": "STOPPED",
         "filename": filename,
-        "corrected_code": working,
+        "original_code": original_source,
+        "corrected_code": working if autocorrect else None,
+        "autocorrect": autocorrect,
         "applied_steps": [],
         "logs": [],
         "errors": [],
@@ -696,6 +830,8 @@ def repair_source_for_gui(source_text: str, filename: str = "main.c") -> Dict[st
         "security_changed_lines": [],
         "stats": stats,
         "green_report": {},
+        "guardrail_report": guard_res.to_dict(),
+        "suggestions": [],
     }
 
     # ---------------------------------------------------------
@@ -845,6 +981,12 @@ def repair_source_for_gui(source_text: str, filename: str = "main.c") -> Dict[st
                 result["status"] = "UNFIXABLE"
                 break
 
+            patch_check = default_guardrail.scan_candidate_patch(working, ai_src, context={"filename": filename, "source": "ai_repair"})
+            if not patch_check.passed:
+                logs.append(f"AAI Guardrail quarantined AI candidate patch: {patch_check.reason}")
+                result["status"] = "UNFIXABLE"
+                break
+
             working = ai_src
             steps.append(f"AI: {cmd}")
             logs.append(f"Applied AI patch: {cmd}")
@@ -901,6 +1043,12 @@ def repair_source_for_gui(source_text: str, filename: str = "main.c") -> Dict[st
 
                     if cmd is None or ai_src == working or tree2 is None:
                         logs.append("AI: no valid patch produced.")
+                        result["status"] = "UNFIXABLE"
+                        break
+
+                    patch_check = default_guardrail.scan_candidate_patch(working, ai_src, context={"filename": filename, "source": "ai_fallback"})
+                    if not patch_check.passed:
+                        logs.append(f"AAI Guardrail quarantined AI candidate patch: {patch_check.reason}")
                         result["status"] = "UNFIXABLE"
                         break
 
@@ -985,47 +1133,51 @@ def repair_source_for_gui(source_text: str, filename: str = "main.c") -> Dict[st
                     fix_result = auto_fixer.apply_fixes(working)
 
                     if fix_result.source != working:
-                        changed_now = _compute_changed_lines(working, fix_result.source)
-                        security_changed_lines = sorted(set(security_changed_lines + changed_now))
+                        patch_check = default_guardrail.scan_candidate_patch(working, fix_result.source, context={"filename": filename, "source": "security_fixer"})
+                        if not patch_check.passed:
+                            logs.append(f"AAI Guardrail quarantined security fix: {patch_check.reason}")
+                        else:
+                            changed_now = _compute_changed_lines(working, fix_result.source)
+                            security_changed_lines = sorted(set(security_changed_lines + changed_now))
 
-                        for step in fix_result.applied_steps:
-                            steps.append(step)
-                            logs.append(f"Applied security fix: {step}")
+                            for step in fix_result.applied_steps:
+                                steps.append(step)
+                                logs.append(f"Applied security fix: {step}")
 
-                        ai_sec_count = sum(1 for s in fix_result.applied_steps if s.startswith("AISEC:"))
-                        stats["ai_fixes"] += ai_sec_count
-                        if ai_sec_count > 0:
-                            green.inc("ai_fixes", ai_sec_count)
+                            ai_sec_count = sum(1 for s in fix_result.applied_steps if s.startswith("AISEC:"))
+                            stats["ai_fixes"] += ai_sec_count
+                            if ai_sec_count > 0:
+                                green.inc("ai_fixes", ai_sec_count)
 
-                        working = fix_result.source
-                        security_rounds += 1
+                            working = fix_result.source
+                            security_rounds += 1
 
-                        if security_rounds > MAX_SECURITY_ROUNDS:
+                            if security_rounds > MAX_SECURITY_ROUNDS:
+                                green.end("security_phase")
+                                logs.append("Stopping: exceeded maximum security reparse rounds.")
+                                result["status"] = "STOPPED"
+                                result["success"] = False
+                                break
+
+                            tree2, listeners2, parser2 = parse_source(
+                                working,
+                                f"{filename} (gui-after-security-{security_rounds})",
+                            )
+
+                            if tree2 is None or has_any_errors(listeners2):
+                                green.end("security_phase")
+                                logs.append("Stopping: security fix broke parsing.")
+                                parse_errors = get_all_error_strings(listeners2) if tree2 is not None else []
+                                result["status"] = "STOPPED"
+                                result["success"] = False
+                                tree = tree2
+                                listeners = listeners2
+                                parser = parser2
+                                break
+
+                            tree, listeners, parser = tree2, listeners2, parser2
                             green.end("security_phase")
-                            logs.append("Stopping: exceeded maximum security reparse rounds.")
-                            result["status"] = "STOPPED"
-                            result["success"] = False
-                            break
-
-                        tree2, listeners2, parser2 = parse_source(
-                            working,
-                            f"{filename} (gui-after-security-{security_rounds})",
-                        )
-
-                        if tree2 is None or has_any_errors(listeners2):
-                            green.end("security_phase")
-                            logs.append("Stopping: security fix broke parsing.")
-                            parse_errors = get_all_error_strings(listeners2) if tree2 is not None else []
-                            result["status"] = "STOPPED"
-                            result["success"] = False
-                            tree = tree2
-                            listeners = listeners2
-                            parser = parser2
-                            break
-
-                        tree, listeners, parser = tree2, listeners2, parser2
-                        green.end("security_phase")
-                        continue
+                            continue
 
                     logs.append("SecurityAutoFixer produced no code change.")
                 except Exception as e:
@@ -1061,16 +1213,23 @@ def repair_source_for_gui(source_text: str, filename: str = "main.c") -> Dict[st
     # Final payload
     # ---------------------------------------------------------
     changed_lines = _compute_changed_lines(original_source, working)
+    suggestions = _build_suggestions(original_source, working, steps)
 
-    result["corrected_code"] = working
+    result["original_code"] = original_source
+    result["autocorrect"] = autocorrect
+    result["corrected_code"] = working if autocorrect else None
+    result["suggestions"] = suggestions
     result["applied_steps"] = steps
     result["logs"] = logs
     result["errors"] = parse_errors
-    result["changed_lines"] = changed_lines
-    result["security_changed_lines"] = security_changed_lines
+    result["changed_lines"] = changed_lines if autocorrect else []
+    result["security_changed_lines"] = security_changed_lines if autocorrect else []
     result["stats"] = stats
     result["total_applied_steps"] = len(steps)
     logs.append(f"Total applied steps: {len(steps)}")
+
+    if not autocorrect and result.get("success"):
+        result["status"] = "SUGGESTIONS_READY"
 
     green.end("total")
 

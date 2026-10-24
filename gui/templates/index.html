@@ -14,7 +14,14 @@
         </div>
 
         <div class="controls">
-            <button onclick="runRepair()">Run Current File</button>
+            <div class="autocorrect-wrapper">
+                <label class="toggle-switch" title="When ON, repairs code automatically. When OFF, suggests fixes without editing code.">
+                    <input type="checkbox" id="autocorrect-toggle" checked onchange="handleAutocorrectChange(this.checked)">
+                    <span class="toggle-slider"></span>
+                </label>
+                <span id="autocorrect-label" class="autocorrect-label">Autocorrect: ON</span>
+            </div>
+            <button id="run-btn" onclick="runRepair()">Run Current File</button>
             <button onclick="newFile()">New File</button>
             <button onclick="refreshExamples()">Refresh Files</button>
         </div>
@@ -50,8 +57,81 @@
 
                     <section class="resultpanel" id="resultpanel">
                         <section class="panelcard">
-                            <h3>Status</h3>
+                            <div class="card-header-flex">
+                                <h3>Status</h3>
+                                <span id="mode-badge" class="badge badge-primary">Auto-Fix Mode</span>
+                            </div>
                             <div id="status">Idle</div>
+                        </section>
+
+                        <!-- Suggestions Panel (Displayed when in Suggestion Mode or when suggestions are available) -->
+                        <section class="panelcard" id="suggestions-card" style="display: none;">
+                            <div class="card-header-flex">
+                                <h3>Suggestions & Fix Review</h3>
+                                <span class="badge badge-info" id="suggestions-count">0 suggestions</span>
+                            </div>
+                            <div class="card-desc">Review compiler diagnostics below. Click "Apply Fix" to update individual lines safely.</div>
+                            <div id="suggestions-feedback" class="feedback-msg" style="display: none;"></div>
+                            <div id="suggestions-list" class="suggestions-list"></div>
+                        </section>
+
+                        <!-- AAI Security Guardrail & Attack Simulation Panel -->
+                        <section class="panelcard" id="aai-guardrail-card">
+                            <div class="card-header-flex">
+                                <h3>AAI Security Shield</h3>
+                                <span class="badge badge-success" id="aai-shield-status">Active</span>
+                            </div>
+                            <div class="card-desc">Enforceable Agentic AI Guardrail inspecting prompt injection, policy bypass & trojan candidate patches.</div>
+
+                            <!-- Attack Simulation Controls -->
+                            <div class="aai-sim-box">
+                                <div class="sim-label">Controlled Attack Simulator (Safe Demo):</div>
+                                <div class="sim-controls">
+                                    <select id="aai-scenario-select">
+                                        <option value="prompt_injection_comment">Prompt Injection (Comment Jailbreak)</option>
+                                        <option value="policy_bypass_request">Policy Bypass ([INST] Tag Override)</option>
+                                        <option value="trojan_patch_exfiltration">Trojan Patch (Credential Access)</option>
+                                        <option value="benign_comment_test">Benign Technical Comment (Non-adversarial)</option>
+                                    </select>
+                                    <button id="sim-btn" onclick="runAttackSimulation()">Simulate Attack</button>
+                                </div>
+                                <div id="aai-sim-feedback" class="aai-feedback-box" style="display: none;"></div>
+                            </div>
+
+                            <!-- Measured Evaluation Metrics -->
+                            <div class="aai-metrics-section">
+                                <div class="metrics-header-flex">
+                                    <span class="metrics-title">Measured Benchmark Metrics</span>
+                                    <button class="small-btn" onclick="fetchAAIMetrics()">Refresh</button>
+                                </div>
+                                <div class="metrics-grid" id="aai-metrics-grid">
+                                    <div class="metric-cell">
+                                        <div class="metric-val" id="metric-adr">--</div>
+                                        <div class="metric-lbl">Detection Rate (ADR)</div>
+                                    </div>
+                                    <div class="metric-cell">
+                                        <div class="metric-val" id="metric-bsr">--</div>
+                                        <div class="metric-lbl">Block Success (BSR)</div>
+                                    </div>
+                                    <div class="metric-cell">
+                                        <div class="metric-val" id="metric-fpr">--</div>
+                                        <div class="metric-lbl">False Positives (FPR)</div>
+                                    </div>
+                                    <div class="metric-cell">
+                                        <div class="metric-val" id="metric-latency">--</div>
+                                        <div class="metric-lbl">Avg Latency</div>
+                                    </div>
+                                </div>
+                                <div class="metrics-footnote">* Ground-truth metrics calculated dynamically from 28 benchmark test vectors.</div>
+                            </div>
+
+                            <!-- Blocked Attacks Audit Log -->
+                            <div class="aai-audit-section">
+                                <div class="metrics-title">Recent Attack Audit Log</div>
+                                <ul id="aai-audit-list" class="audit-list">
+                                    <li>No attacks blocked in current session.</li>
+                                </ul>
+                            </div>
                         </section>
 
                         <section class="panelcard">

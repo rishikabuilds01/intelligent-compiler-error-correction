@@ -6,6 +6,7 @@ const openFiles = {};
 let openTabs = [];
 let currentFilename = "main.c";
 let repairOriginalCode = null;
+let isAutocorrectEnabled = true;
 
 require.config({
     paths: {
@@ -47,11 +48,30 @@ require(["vs/editor/editor.main"], function () {
     });
 
     refreshExamples();
+    fetchAAIMetrics();
     initSidebarResize();
     initRightPanelResize();
     initBottomResize();
     initTestcaseResize();
 });
+
+function handleAutocorrectChange(enabled) {
+    isAutocorrectEnabled = !!enabled;
+    const label = document.getElementById("autocorrect-label");
+    const badge = document.getElementById("mode-badge");
+
+    if (label) {
+        label.innerText = isAutocorrectEnabled ? "Autocorrect: ON" : "Autocorrect: OFF";
+    }
+    if (badge) {
+        badge.innerText = isAutocorrectEnabled ? "Auto-Fix Mode" : "Suggestion Mode";
+        badge.className = isAutocorrectEnabled ? "badge badge-primary" : "badge badge-info";
+    }
+
+    if (isAutocorrectEnabled) {
+        hideSuggestions();
+    }
+}
 
 function fillList(id, items, formatter = null) {
     const el = document.getElementById(id);
@@ -306,11 +326,13 @@ function setStatus(statusText) {
     if (!el) return;
 
     el.innerText = statusText || "Unknown";
-
     el.className = "";
+
     if (statusText === "SUCCESS") el.classList.add("status-success");
+    else if (statusText === "SUGGESTIONS_READY") el.classList.add("status-success");
     else if (statusText === "SUCCESS_WITH_WARNINGS") el.classList.add("status-warning");
     else if (statusText === "BLOCKED_SECURITY") el.classList.add("status-danger");
+    else if (statusText === "BLOCKED_AAI_ATTACK") el.classList.add("status-danger");
     else if (statusText === "SEM_ISSUES") el.classList.add("status-warning");
     else if (statusText === "UNFIXABLE" || statusText === "STOPPED") el.classList.add("status-danger");
 }
@@ -350,6 +372,7 @@ function resetPanels() {
     renderGreenReport({});
     clearChangedLineHighlights();
     resetProgress();
+    hideSuggestions();
 }
 
 function renderTabs() {
@@ -442,13 +465,39 @@ function computeChangedLines(beforeCode, afterCode) {
 
 function renderRepairResult(data) {
     const beforeCode = repairOriginalCode ?? "";
-    const afterCode = data.corrected_code || editor.getValue();
+    const isAutocorrect = data.autocorrect !== false;
 
-    suppressHighlightClearOnce = true;
-    editor.setValue(afterCode);
-    openFiles[currentFilename] = afterCode;
+    // Handle AAI Attack Blocked State
+    if (data.status === "BLOCKED_AAI_ATTACK") {
+        setStatus("BLOCKED_AAI_ATTACK");
+        const shieldBadge = document.getElementById("aai-shield-status");
+        if (shieldBadge) {
+            shieldBadge.innerText = "Attack Blocked 🛑";
+            shieldBadge.className = "badge badge-danger";
+        }
+        fillList("errors", data.errors || ["Malicious input blocked by AAI Guardrail."]);
+        fillList("logs", data.logs || []);
+        fetchAAIMetrics();
+        repairOriginalCode = null;
+        return;
+    }
 
     setStatus(data.status || "Unknown");
+
+    // Autocorrect ON: Update editor content directly
+    if (isAutocorrect && data.corrected_code) {
+        suppressHighlightClearOnce = true;
+        editor.setValue(data.corrected_code);
+        openFiles[currentFilename] = data.corrected_code;
+
+        const changedLines = computeChangedLines(beforeCode, data.corrected_code);
+        highlightLines(changedLines, data.security_changed_lines || []);
+        hideSuggestions();
+    } else {
+        // Autocorrect OFF: Never modify editor code; render suggestions list
+        clearChangedLineHighlights();
+        renderSuggestions(data.suggestions || []);
+    }
 
     fillList("steps", data.applied_steps || []);
     fillList("errors", data.errors || []);
@@ -471,9 +520,6 @@ function renderRepairResult(data) {
     renderStats(data.stats || {});
     renderGreenReport(data.green_report || {});
 
-    const changedLines = computeChangedLines(beforeCode, afterCode);
-    highlightLines(changedLines, data.security_changed_lines || []);
-
     repairOriginalCode = null;
 }
 
@@ -485,14 +531,15 @@ async function runRepair() {
 
     resetPanels();
     setStatus("RUNNING");
-    setProgress(2, "Starting repair...");
+    setProgress(2, isAutocorrectEnabled ? "Starting repair..." : "Analyzing code for suggestions...");
 
     const response = await fetch("/api/repair_stream", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
             code: repairOriginalCode,
-            filename: currentFilename
+            filename: currentFilename,
+            autocorrect: isAutocorrectEnabled
         })
     });
 
@@ -513,8 +560,17 @@ async function runRepair() {
 
             const data = JSON.parse(chunk.slice(6));
 
+            if (data.type === "guardrail") {
+                setProgress(2, data.message || "Scanning input with AAI Guardrail...");
+            }
+
+            if (data.type === "guardrail_blocked") {
+                setProgress(100, data.message || "Blocked by AAI Guardrail");
+                setStatus("BLOCKED_AAI_ATTACK");
+            }
+
             if (data.type === "start") {
-                setProgress(3, data.message || "Started...");
+                setProgress(5, data.message || "Started...");
             }
 
             if (data.type === "detect") {
@@ -541,6 +597,269 @@ async function runRepair() {
     }
 }
 
+/* -------------------------------------------------- */
+/* SUGGESTIONS & SELECTIVE FIX LOGIC (Autocorrect OFF) */
+/* -------------------------------------------------- */
+
+function hideSuggestions() {
+    const card = document.getElementById("suggestions-card");
+    if (card) card.style.display = "none";
+}
+
+function renderSuggestions(suggestions) {
+    const card = document.getElementById("suggestions-card");
+    const countBadge = document.getElementById("suggestions-count");
+    const list = document.getElementById("suggestions-list");
+    const feedback = document.getElementById("suggestions-feedback");
+
+    if (!card || !list) return;
+
+    if (feedback) feedback.style.display = "none";
+
+    if (!suggestions || suggestions.length === 0) {
+        card.style.display = "block";
+        if (countBadge) countBadge.innerText = "0 suggestions";
+        list.innerHTML = `<div style="font-size: 13px; color: #64748b; padding: 8px;">No syntax or structural fixes needed. Code passed analysis.</div>`;
+        return;
+    }
+
+    card.style.display = "block";
+    if (countBadge) countBadge.innerText = `${suggestions.length} suggestion${suggestions.length > 1 ? "s" : ""}`;
+
+    list.innerHTML = "";
+
+    suggestions.forEach((sug, idx) => {
+        const item = document.createElement("div");
+        item.className = "suggestion-card";
+        item.id = `sug-card-${idx}`;
+
+        const catBadgeClass = sug.category === "SECURITY" ? "badge-danger" : (sug.category === "SEMANTIC" ? "badge-warning" : "badge-primary");
+
+        item.innerHTML = `
+            <div class="sug-header">
+                <span class="sug-title">Line ${sug.line}: ${escapeHtml(sug.title || "Fix required")}</span>
+                <span class="badge ${catBadgeClass}">${escapeHtml(sug.category || "SYNTAX")}</span>
+            </div>
+            <div class="sug-explanation">${escapeHtml(sug.explanation || "")}</div>
+            <div class="sug-diff">
+                <div class="diff-del">- ${escapeHtml(sug.original_snippet || "")}</div>
+                <div class="diff-ins">+ ${escapeHtml(sug.suggested_snippet || "")}</div>
+            </div>
+            <button class="apply-btn" id="btn-apply-${idx}" onclick="applySingleSuggestion('${escapeJs(sug.id)}', ${sug.line}, '${escapeJs(sug.original_snippet)}', '${escapeJs(sug.suggested_snippet)}', ${idx})">
+                Apply This Fix
+            </button>
+        `;
+        list.appendChild(item);
+    });
+}
+
+function escapeHtml(str) {
+    if (!str) return "";
+    return String(str).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+}
+
+function escapeJs(str) {
+    if (!str) return "";
+    return String(str).replace(/\\/g, "\\\\").replace(/'/g, "\\'").replace(/\n/g, "\\n");
+}
+
+async function applySingleSuggestion(sugId, line, expectedOriginal, replacement, cardIdx) {
+    if (!editor) return;
+
+    const btn = document.getElementById(`btn-apply-${cardIdx}`);
+    if (btn) {
+        btn.disabled = true;
+        btn.innerText = "Applying...";
+    }
+
+    const feedback = document.getElementById("suggestions-feedback");
+
+    try {
+        const response = await fetch("/api/apply_suggestion", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+                code: editor.getValue(),
+                suggestion_id: sugId,
+                line: line,
+                expected_original: expectedOriginal,
+                replacement: replacement
+            })
+        });
+
+        const data = await response.json();
+
+        if (response.ok && data.success) {
+            suppressHighlightClearOnce = true;
+            editor.setValue(data.updated_code);
+            openFiles[currentFilename] = data.updated_code;
+
+            highlightLines([line], []);
+
+            if (btn) {
+                btn.innerText = "Applied ✓";
+                btn.style.background = "#16a34a";
+            }
+
+            if (feedback) {
+                feedback.className = "feedback-msg feedback-success";
+                feedback.innerText = `Applied fix to line ${line} successfully.`;
+                feedback.style.display = "block";
+            }
+        } else {
+            if (btn) {
+                btn.disabled = false;
+                btn.innerText = "Apply This Fix";
+            }
+
+            const errorMsg = data.error === "STALE_SOURCE"
+                ? `Cannot apply fix: source code at line ${line} has changed since suggestions were generated. Please re-run analysis.`
+                : (data.message || "Failed to apply suggestion.");
+
+            if (feedback) {
+                feedback.className = "feedback-msg feedback-error";
+                feedback.innerText = errorMsg;
+                feedback.style.display = "block";
+            }
+        }
+    } catch (err) {
+        if (btn) {
+            btn.disabled = false;
+            btn.innerText = "Apply This Fix";
+        }
+        if (feedback) {
+            feedback.className = "feedback-msg feedback-error";
+            feedback.innerText = `Error applying suggestion: ${err.message}`;
+            feedback.style.display = "block";
+        }
+    }
+}
+
+/* -------------------------------------------------- */
+/* AAI ATTACK SIMULATOR & METRICS TELEMETRY */
+/* -------------------------------------------------- */
+
+async function runAttackSimulation() {
+    const select = document.getElementById("aai-scenario-select");
+    const btn = document.getElementById("sim-btn");
+    const feedback = document.getElementById("aai-sim-feedback");
+
+    if (!select) return;
+    const scenario = select.value;
+
+    if (btn) {
+        btn.disabled = true;
+        btn.innerText = "Simulating...";
+    }
+
+    try {
+        const response = await fetch("/api/aai_simulate_attack", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ scenario: scenario })
+        });
+
+        const data = await response.json();
+
+        if (feedback) {
+            feedback.style.display = "block";
+            if (data.threat_detected) {
+                feedback.className = "aai-feedback-box feedback-error";
+                feedback.innerHTML = `
+                    <div style="font-weight: 700; margin-bottom: 3px;">🛑 Attack Intercepted (${escapeHtml(data.verdict)})</div>
+                    <div><b>Type:</b> ${escapeHtml(data.attack_type)} | <b>Risk:</b> ${escapeHtml(data.risk_level)}</div>
+                    <div><b>Action:</b> ${escapeHtml(data.mitigation_action)} (${data.latency_ms} ms)</div>
+                    <div style="margin-top: 4px; font-size: 11px;"><b>Reason:</b> ${escapeHtml(data.reason)}</div>
+                `;
+            } else {
+                feedback.className = "aai-feedback-box feedback-success";
+                feedback.innerHTML = `
+                    <div style="font-weight: 700; margin-bottom: 3px;">🟢 Non-Adversarial Input Allowed (${escapeHtml(data.verdict)})</div>
+                    <div><b>Action:</b> ${escapeHtml(data.mitigation_action)} (${data.latency_ms} ms)</div>
+                    <div style="margin-top: 4px; font-size: 11px;"><b>Verification:</b> ${escapeHtml(data.reason)}</div>
+                `;
+            }
+        }
+
+        if (data.metrics) {
+            renderMetricsBoxes(data.metrics);
+        }
+
+        fetchAAIMetrics();
+    } catch (err) {
+        if (feedback) {
+            feedback.className = "aai-feedback-box feedback-error";
+            feedback.innerText = `Simulation request failed: ${err.message}`;
+            feedback.style.display = "block";
+        }
+    } finally {
+        if (btn) {
+            btn.disabled = false;
+            btn.innerText = "Simulate Attack";
+        }
+    }
+}
+
+async function fetchAAIMetrics() {
+    try {
+        const response = await fetch("/api/aai_metrics");
+        const data = await response.json();
+
+        if (data.benchmark_metrics) {
+            renderMetricsBoxes(data.benchmark_metrics);
+        }
+
+        if (data.audit_log) {
+            renderAuditLog(data.audit_log);
+        }
+    } catch (err) {
+        console.error("Failed to fetch AAI metrics:", err);
+    }
+}
+
+function renderMetricsBoxes(m) {
+    const elAdr = document.getElementById("metric-adr");
+    const elBsr = document.getElementById("metric-bsr");
+    const elFpr = document.getElementById("metric-fpr");
+    const elLat = document.getElementById("metric-latency");
+
+    if (elAdr) elAdr.innerText = `${m.adr_percent ?? "--"}%`;
+    if (elBsr) elBsr.innerText = m.bsr_percent !== null && m.bsr_percent !== undefined ? `${m.bsr_percent}%` : "N/A";
+    if (elFpr) elFpr.innerText = `${m.fpr_percent ?? "--"}%`;
+    if (elLat) elLat.innerText = `${m.avg_latency_ms ?? "--"} ms`;
+}
+
+function renderAuditLog(auditEntries) {
+    const list = document.getElementById("aai-audit-list");
+    if (!list) return;
+
+    if (!auditEntries || auditEntries.length === 0) {
+        list.innerHTML = `<li>No attacks blocked in current session.</li>`;
+        return;
+    }
+
+    list.innerHTML = "";
+    auditEntries.forEach(entry => {
+        const li = document.createElement("li");
+        const isBlocked = entry.verdict === "BLOCKED_INPUT";
+        const badgeClass = isBlocked ? "audit-badge audit-blocked" : "audit-badge audit-quarantine";
+        const label = isBlocked ? "BLOCKED" : "QUARANTINED";
+
+        li.innerHTML = `
+            <span class="${badgeClass}">${label}</span>
+            <b>${escapeHtml(entry.attack_type || "UNKNOWN")}:</b> ${escapeHtml(entry.reason || "")}
+            <div style="font-size: 10px; color: #64748b; margin-top: 2px;">
+                ${escapeHtml(entry.timestamp || "")} (${entry.latency_ms} ms)
+            </div>
+        `;
+        list.appendChild(li);
+    });
+}
+
+/* -------------------------------------------------- */
+/* TEST CASE & EXAMPLES RUNNER */
+/* -------------------------------------------------- */
+
 async function runTestCase() {
     const input = document.getElementById("testcase-input").value;
     const output = document.getElementById("testcase-output");
@@ -552,7 +871,8 @@ async function runTestCase() {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
             code: input,
-            filename: "test_case.c"
+            filename: "test_case.c",
+            autocorrect: isAutocorrectEnabled
         })
     });
 
